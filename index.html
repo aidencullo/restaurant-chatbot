@@ -61,48 +61,35 @@
       color: var(--text-light);
     }
 
-    .api-key-bar {
+    #model-bar {
       background: var(--card);
       border-bottom: 1px solid var(--border);
-      padding: 10px 24px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
+      padding: 12px 24px;
       flex-shrink: 0;
     }
 
-    .api-key-bar label {
+    #model-bar.hidden { display: none; }
+
+    .progress-label {
       font-size: 13px;
-      font-weight: 600;
-      white-space: nowrap;
       color: var(--text-light);
+      margin-bottom: 6px;
     }
 
-    .api-key-bar input {
-      flex: 1;
-      padding: 8px 12px;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      font-size: 13px;
-      font-family: monospace;
-      outline: none;
-      transition: border-color 0.2s;
+    .progress-bar {
+      width: 100%;
+      height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
     }
 
-    .api-key-bar input:focus {
-      border-color: var(--accent);
-    }
-
-    .api-key-bar .status {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: #ccc;
-      flex-shrink: 0;
-    }
-
-    .api-key-bar .status.connected {
-      background: #4caf50;
+    .progress-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 3px;
+      width: 0%;
+      transition: width 0.3s;
     }
 
     #chat-container {
@@ -277,6 +264,17 @@
       border-color: var(--accent);
       color: var(--accent);
     }
+
+    .no-webgpu {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-light);
+    }
+
+    .no-webgpu h2 {
+      color: var(--accent);
+      margin-bottom: 12px;
+    }
   </style>
 </head>
 <body>
@@ -284,20 +282,19 @@
     <div class="logo">B</div>
     <div class="header-text">
       <h1>Bella's Kitchen</h1>
-      <p>Ask about our menu, hours, reservations & more</p>
+      <p>AI assistant powered by Qwen 2.5 — runs entirely in your browser</p>
     </div>
   </header>
 
-  <div class="api-key-bar">
-    <label for="api-key">API Key:</label>
-    <input type="password" id="api-key" placeholder="sk-ant-..." />
-    <div class="status" id="key-status" title="Not connected"></div>
+  <div id="model-bar">
+    <div class="progress-label" id="progress-label">Loading AI model... (first visit downloads ~900 MB, cached after)</div>
+    <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
   </div>
 
   <div id="chat-container">
-    <div class="welcome">
+    <div class="welcome" id="welcome">
       <h2>Welcome to Bella's Kitchen</h2>
-      <p>I'm here to help with anything about our restaurant.</p>
+      <p>I'm here to help with anything about our restaurant.<br>The AI model is loading — you can chat once it's ready.</p>
       <div class="suggestions">
         <button onclick="sendSuggestion(this)">What's on the menu?</button>
         <button onclick="sendSuggestion(this)">What are your hours?</button>
@@ -308,11 +305,13 @@
   </div>
 
   <div id="input-area">
-    <textarea id="user-input" rows="1" placeholder="Ask us anything..." onkeydown="handleKey(event)"></textarea>
-    <button id="send-btn" onclick="sendMessage()">Send</button>
+    <textarea id="user-input" rows="1" placeholder="Ask us anything..." onkeydown="handleKey(event)" disabled></textarea>
+    <button id="send-btn" onclick="sendMessage()" disabled>Send</button>
   </div>
 
-  <script>
+  <script type="module">
+    import * as webllm from "https://esm.run/@mlc-ai/web-llm";
+
     const SYSTEM_PROMPT = `You are the friendly virtual assistant for Bella's Kitchen, an Italian-American restaurant. Answer customer questions warmly and helpfully. Keep answers concise.
 
 RESTAURANT INFO:
@@ -386,34 +385,63 @@ CURRENT SPECIALS:
 
 If a customer asks about something you don't have information on, kindly suggest they call the restaurant directly.`;
 
+    const MODEL_ID = "Qwen2.5-1.5B-Instruct-q4f16_1-MLC";
+
     const chatContainer = document.getElementById('chat-container');
     const userInput = document.getElementById('user-input');
     const sendBtn = document.getElementById('send-btn');
-    const apiKeyInput = document.getElementById('api-key');
-    const keyStatus = document.getElementById('key-status');
+    const modelBar = document.getElementById('model-bar');
+    const progressLabel = document.getElementById('progress-label');
+    const progressFill = document.getElementById('progress-fill');
+
+    let engine = null;
     let messages = [];
     let isLoading = false;
 
-    // Restore API key from sessionStorage
-    const savedKey = sessionStorage.getItem('anthropic_key');
-    if (savedKey) {
-      apiKeyInput.value = savedKey;
-      keyStatus.classList.add('connected');
-      keyStatus.title = 'Key saved';
+    // Check WebGPU support
+    if (!navigator.gpu) {
+      modelBar.classList.add('hidden');
+      chatContainer.innerHTML = `
+        <div class="no-webgpu">
+          <h2>WebGPU Not Supported</h2>
+          <p>This chatbot runs an AI model directly in your browser using WebGPU.</p>
+          <p>Please use <strong>Chrome 113+</strong> or <strong>Edge 113+</strong> on a desktop device.</p>
+          <p>Safari and Firefox do not fully support WebGPU yet.</p>
+        </div>
+      `;
+    } else {
+      initEngine();
     }
 
-    apiKeyInput.addEventListener('input', () => {
-      const key = apiKeyInput.value.trim();
-      if (key) {
-        sessionStorage.setItem('anthropic_key', key);
-        keyStatus.classList.add('connected');
-        keyStatus.title = 'Key saved';
-      } else {
-        sessionStorage.removeItem('anthropic_key');
-        keyStatus.classList.remove('connected');
-        keyStatus.title = 'Not connected';
+    async function initEngine() {
+      try {
+        engine = await webllm.CreateMLCEngine(MODEL_ID, {
+          initProgressCallback: (report) => {
+            progressLabel.textContent = report.text;
+            if (report.progress !== undefined) {
+              progressFill.style.width = (report.progress * 100) + '%';
+            }
+          },
+        });
+
+        // Model loaded — enable input
+        modelBar.classList.add('hidden');
+        userInput.disabled = false;
+        sendBtn.disabled = false;
+        userInput.placeholder = "Ask us anything...";
+        userInput.focus();
+
+        const welcomeP = document.querySelector('.welcome p');
+        if (welcomeP) {
+          welcomeP.textContent = "I'm here to help with anything about our restaurant.";
+        }
+      } catch (err) {
+        progressLabel.textContent = `Failed to load model: ${err.message}`;
+        progressFill.style.background = '#e53935';
+        progressFill.style.width = '100%';
+        console.error(err);
       }
-    });
+    }
 
     // Auto-resize textarea
     userInput.addEventListener('input', () => {
@@ -421,20 +449,20 @@ If a customer asks about something you don't have information on, kindly suggest
       userInput.style.height = Math.min(userInput.scrollHeight, 120) + 'px';
     });
 
-    function handleKey(e) {
+    window.handleKey = function(e) {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         sendMessage();
       }
-    }
+    };
 
-    function sendSuggestion(btn) {
+    window.sendSuggestion = function(btn) {
+      if (!engine || userInput.disabled) return;
       userInput.value = btn.textContent;
       sendMessage();
-    }
+    };
 
     function addMessage(role, text) {
-      // Remove welcome screen on first message
       const welcome = chatContainer.querySelector('.welcome');
       if (welcome) welcome.remove();
 
@@ -446,6 +474,7 @@ If a customer asks about something you don't have information on, kindly suggest
       `;
       chatContainer.appendChild(div);
       chatContainer.scrollTop = chatContainer.scrollHeight;
+      return div;
     }
 
     function showTyping() {
@@ -471,16 +500,9 @@ If a customer asks about something you don't have information on, kindly suggest
       return div.innerHTML;
     }
 
-    async function sendMessage() {
+    window.sendMessage = async function() {
       const text = userInput.value.trim();
-      const apiKey = apiKeyInput.value.trim();
-
-      if (!text || isLoading) return;
-
-      if (!apiKey) {
-        addMessage('assistant', 'Please enter your Anthropic API key above to get started.');
-        return;
-      }
+      if (!text || isLoading || !engine) return;
 
       isLoading = true;
       sendBtn.disabled = true;
@@ -493,45 +515,31 @@ If a customer asks about something you don't have information on, kindly suggest
       showTyping();
 
       try {
-        const res = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01',
-            'anthropic-dangerous-direct-browser-access': 'true',
-          },
-          body: JSON.stringify({
-            model: 'claude-haiku-4-5-20251001',
-            max_tokens: 1024,
-            system: SYSTEM_PROMPT,
-            messages: messages,
-          }),
+        const reply = await engine.chat.completions.create({
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPT },
+            ...messages,
+          ],
+          max_tokens: 512,
+          temperature: 0.7,
         });
 
         removeTyping();
 
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          throw new Error(err.error?.message || `API error: ${res.status}`);
-        }
-
-        const data = await res.json();
-        const reply = data.content[0].text;
-
-        messages.push({ role: 'assistant', content: reply });
-        addMessage('assistant', reply);
+        const content = reply.choices[0].message.content;
+        messages.push({ role: 'assistant', content });
+        addMessage('assistant', content);
       } catch (err) {
         removeTyping();
         addMessage('assistant', `Something went wrong: ${err.message}`);
-        // Remove the failed exchange from history
         messages.pop();
+        console.error(err);
       }
 
       isLoading = false;
       sendBtn.disabled = false;
       userInput.focus();
-    }
+    };
   </script>
 </body>
 </html>
